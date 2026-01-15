@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"path/filepath"
 
+	"entgo.io/ent/dialect/sql"
 	"gopkg.in/yaml.v3"
 	"realm.pub/tavern/internal/ent"
 	"realm.pub/tavern/internal/ent/tome"
@@ -120,13 +121,13 @@ func UploadTomes(ctx context.Context, graph *ent.Client, fileSystem fs.ReadDirFS
 			}
 
 			// Parse metadata.yml
-			if filepath.Base(path) == "metadata.yml" {
+			if filepath.Base(path) == "metadata.yml" || filepath.Base(path) == "metadata.yaml" {
 				if err := yaml.Unmarshal(content, &metadata); err != nil {
 					return rollback(tx, fmt.Errorf("failed to parse %q: %w", path, err))
 				}
 				// Validate Metadata
 				if err := metadata.Validate(); err != nil {
-					return rollback(tx, fmt.Errorf("invalid tome metadata %q: %w", entry.Name(), err))
+					return rollback(tx, fmt.Errorf("invalid tome metadata %q: %w", path, err))
 				}
 				return nil
 			}
@@ -158,17 +159,26 @@ func UploadTomes(ctx context.Context, graph *ent.Client, fileSystem fs.ReadDirFS
 			return rollback(tx, fmt.Errorf("failed to parse param defs for %q: %w", metadata.Name, err))
 		}
 
+		var support *tome.SupportModel
+		if metadata.SupportModel != "" {
+			sm := tome.SupportModel(metadata.SupportModel)
+			support = &sm
+		}
 		// Create the tome
-		if _, err := graph.Tome.Create().
+		if err := graph.Tome.Create().
 			SetName(metadata.Name).
 			SetDescription(metadata.Description).
 			SetAuthor(metadata.Author).
 			SetParamDefs(string(paramdefs)).
-			SetSupportModel(tome.SupportModel(metadata.SupportModel)).
+			SetNillableSupportModel(support).
 			SetTactic(tome.Tactic(metadata.Tactic)).
 			SetEldritch(eldritch).
 			AddAssets(tomeAssets...).
-			Save(ctx); err != nil {
+			OnConflict(
+				sql.ConflictColumns("name"), // Or the column(s) with the unique constraint
+			).
+			UpdateNewValues().
+			Exec(ctx); err != nil {
 			return rollback(tx, fmt.Errorf("failed to create tome %q: %w", metadata.Name, err))
 		}
 	}
