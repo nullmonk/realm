@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/ecdh"
+	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -203,6 +204,68 @@ func getRemoteIP(ctx context.Context) string {
 	return host
 }
 
+// loadOrGenerateKeyBytes loads or generates a 32-byte key
+// If cliKey is provided, it is used (checking if it's a file path first).
+// If cliKey is empty, it checks keyPath.
+// If keyPath exists, it loads the key.
+// If keyPath does not exist, it generates a new key and saves it to keyPath.
+func loadOrGenerateKeyBytes(keyPath string, cliKey string) ([]byte, error) {
+	var keyStr string
+
+	// 1. Determine the key string (Base64 encoded)
+	if cliKey != "" {
+		// Check if cliKey is a file path
+		if _, err := os.Stat(cliKey); err == nil {
+			content, err := os.ReadFile(cliKey)
+			if err != nil {
+				return nil, fmt.Errorf("failed to read private key file '%s': %v", cliKey, err)
+			}
+			keyStr = strings.TrimSpace(string(content))
+		} else {
+			// Assume it's the raw base64 string
+			keyStr = cliKey
+		}
+	} else {
+		// Check default key path
+		if _, err := os.Stat(keyPath); err == nil {
+			log.Printf("Found existing key at %s, loading...", keyPath)
+			content, err := os.ReadFile(keyPath)
+			if err != nil {
+				return nil, fmt.Errorf("failed to read private key file '%s': %v", keyPath, err)
+			}
+			keyStr = strings.TrimSpace(string(content))
+		}
+	}
+
+	// 2. Parse or Generate
+	if keyStr != "" {
+		keyBytes, err := base64.StdEncoding.DecodeString(keyStr)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode private key: %v", err)
+		}
+		if len(keyBytes) != 32 {
+			return nil, fmt.Errorf("invalid key length: expected 32 bytes, got %d", len(keyBytes))
+		}
+		return keyBytes, nil
+	}
+
+	// 3. Generate New
+	log.Println("No private key provided and none found at default path, generating a random one...")
+	keyBytes := make([]byte, 32)
+	if _, err := rand.Read(keyBytes); err != nil {
+		return nil, fmt.Errorf("failed to generate random key: %v", err)
+	}
+
+	// Save the generated key
+	log.Printf("Saving generated private key to %s", keyPath)
+	encodedKey := base64.StdEncoding.EncodeToString(keyBytes)
+	if err := os.WriteFile(keyPath, []byte(encodedKey), 0600); err != nil {
+		log.Printf("Warning: failed to save generated key: %v", err)
+	}
+
+	return keyBytes, nil
+}
+
 func main() {
 	var opts Options
 	parser := flags.NewParser(&opts, flags.Default)
@@ -259,71 +322,36 @@ func main() {
 
 	log.Println("Tomes loaded successfully.")
 
-	// 4. Setup Key Pair
-	var privKey *ecdh.PrivateKey
-	var pubKey *ecdh.PublicKey
-	curve := ecdh.X25519()
-
+	// 4. Setup Key Pair (Common)
 	keyPath := opts.DBName + ".grpc.key"
-	if opts.PrivateKey == "" {
-		if _, err := os.Stat(keyPath); err == nil {
-			log.Printf("Found existing key at %s, loading...", keyPath)
-			content, err := os.ReadFile(keyPath)
-			if err != nil {
-				log.Fatalf("failed to read private key file: %v", err)
-			}
-			opts.PrivateKey = strings.TrimSpace(string(content))
-		}
+	rawKey, err := loadOrGenerateKeyBytes(keyPath, opts.PrivateKey)
+	if err != nil {
+		log.Fatalf("failed to setup keys: %v", err)
 	}
 
-	if opts.PrivateKey != "" {
-		// If it's a file path (other than the default one we might have just checked)
-		if _, err := os.Stat(opts.PrivateKey); err == nil {
-			content, err := os.ReadFile(opts.PrivateKey)
-			if err != nil {
-				log.Fatalf("failed to read private key file: %v", err)
-			}
-			opts.PrivateKey = strings.TrimSpace(string(content))
-		}
-
-		keyBytes, err := base64.StdEncoding.DecodeString(opts.PrivateKey)
-		if err != nil {
-			log.Fatalf("failed to decode private key: %v", err)
-		}
-		privKey, err = curve.NewPrivateKey(keyBytes)
-		if err != nil {
-			log.Fatalf("invalid private key: %v", err)
-		}
-	} else {
-		log.Println("No private key provided and none found at default path, generating a random one...")
-		var err error
-		privKey, err = curve.GenerateKey(rand.Reader)
-		if err != nil {
-			log.Fatalf("failed to generate private key: %v", err)
-		}
-
-		// Save the generated key
-		log.Printf("Saving generated GRPC private key to %s", keyPath)
-		keyBytes := privKey.Bytes()
-		encodedKey := base64.StdEncoding.EncodeToString(keyBytes)
-		if err := os.WriteFile(keyPath, []byte(encodedKey), 0600); err != nil {
-			log.Printf("Warning: failed to save generated key: %v", err)
-		}
+	// gRPC (X25519)
+	grpcPriv, err := ecdh.X25519().NewPrivateKey(rawKey)
+	if err != nil {
+		log.Fatalf("failed to create gRPC private key: %v", err)
 	}
+	grpcPub := grpcPriv.PublicKey()
+	log.Printf("Server Public Key (gRPC X25519): %s", base64.StdEncoding.EncodeToString(grpcPub.Bytes()))
 
-	pubKey = privKey.PublicKey()
-	log.Printf("Server Public Key (Base64): %s", base64.StdEncoding.EncodeToString(pubKey.Bytes()))
+	// JWT (Ed25519)
+	jwtPriv := ed25519.NewKeyFromSeed(rawKey)
+	jwtPub := jwtPriv.Public().(ed25519.PublicKey)
+	log.Printf("Server Public Key (JWT Ed25519): %s", base64.StdEncoding.EncodeToString(jwtPub))
 
-	// 5. Setup gRPC Server
+	// 6. Setup gRPC Server
 	// We use our custom RakeServer
-	baseC2 := c2.New(client, nil, nil)
+	baseC2 := c2.New(client, nil, nil, jwtPub, jwtPriv)
 	rakeSrv := &RakeServer{
 		Server: baseC2,
 		client: client,
 	}
 
 	xchacha := cryptocodec.StreamDecryptCodec{
-		Csvc: cryptocodec.NewCryptoSvc(privKey),
+		Csvc: cryptocodec.NewCryptoSvc(grpcPriv),
 	}
 
 	grpcSrv := grpc.NewServer(
@@ -332,7 +360,7 @@ func main() {
 
 	c2pb.RegisterC2Server(grpcSrv, rakeSrv)
 
-	// 6. Start Server (TLS)
+	// 7. Start Server (TLS)
 	log.Printf("Listening on %s (TLS)", opts.ListenAddr)
 
 	var tlsConfig *tls.Config
@@ -368,7 +396,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
-		fmt.Fprintf(w, "%s\n", base64.StdEncoding.EncodeToString(pubKey.Bytes()))
+		fmt.Fprintf(w, "%s\n", base64.StdEncoding.EncodeToString(grpcPub.Bytes()))
 	})
 
 	// Create a handler that routes traffic to gRPC or HTTP mux based on protocol and content type

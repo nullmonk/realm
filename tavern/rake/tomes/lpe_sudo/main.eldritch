@@ -65,6 +65,7 @@ def main():
 
     # TODO setup a pivot here?
     password = input_params.get("password", "").strip() # Can be blank, will just try a passwordless sudo
+    # TODO: Get the HALLIGAN_PASS here
     print(MODNAME, "trying sudo with", password, exe)
     try_sudo([exe], password=password)
 

@@ -7,7 +7,6 @@ import (
 	"io/fs"
 	"path/filepath"
 
-	"entgo.io/ent/dialect/sql"
 	"gopkg.in/yaml.v3"
 	"realm.pub/tavern/internal/ent"
 	"realm.pub/tavern/internal/ent/tome"
@@ -174,9 +173,7 @@ func UploadTomes(ctx context.Context, graph *ent.Client, fileSystem fs.ReadDirFS
 			SetTactic(tome.Tactic(metadata.Tactic)).
 			SetEldritch(eldritch).
 			AddAssets(tomeAssets...).
-			OnConflict(
-				sql.ConflictColumns("name"), // Or the column(s) with the unique constraint
-			).
+			OnConflict().
 			UpdateNewValues().
 			Exec(ctx); err != nil {
 			return rollback(tx, fmt.Errorf("failed to create tome %q: %w", metadata.Name, err))
