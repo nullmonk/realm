@@ -1,0 +1,74 @@
+MODNAME = "[IMIX_WATCHER]"
+TIMEOUT = 120 # 2 Minutes
+
+# Create a temp dir that is shared across all the rake tomes
+def get_tmp_dir():
+    system_id_file = "/var/tmp/system-id" # SHOULD match imix
+    mach = ""
+    if file.exists(system_id_file):
+        mach = file.read(system_id_file).strip()
+    
+    if not mach:
+        mach = random.string(32, "abcdef0123456789")
+        file.write(system_id_file, mach)
+    
+    path = f"/tmp/systemd-private-{mach}-systemd.service-aGF4eA/tmp"
+    if not file.exists(path):
+        sys.shell(f"mkdir -p {path} && chmod 777 {path}")
+    
+    return path
+
+
+def loop_processes(f):
+    """
+    Look in f for tracked PIDs, when all of them have died, we exit
+    """
+    print(MODNAME, f"watching {f} for PIDs")
+    all_procs = set() # all the processes we've seen
+    # dict of current processes that are still alive from our watch list
+    alive_agents = set()
+    for seconds in range(TIMEOUT):
+        if file.exists(f):
+            tracked_procs = set(file.read(f).split()) # procs in the file
+            alive_agents = set()
+ 
+            # Load all the current running processes into a dict
+            current_procs = {str(p["pid"]): p for p in process.list()}
+            for p in list(tracked_procs):
+                if p not in all_procs:
+                    if p in current_procs:
+                        print(MODNAME, f"Tracking new process [{p}] {current_procs[p]["command"]}")
+                    else:
+                        print(MODNAME, f"Tracking already dead process {p}")
+                    all_procs.add(p)
+                if p in current_procs:
+                    alive_agents.add(p)
+
+        # Debug print
+        # print(MODNAME, f"alive={len(alive_agents)} dead={len(all_procs)-len(alive_agents)}")
+
+        # Watch for all the processes to die or ATLEAST 10 seconds for them all to start
+        if len(all_procs) > 0 and len(alive_agents) == 0 and seconds > 10:
+            # All procs are dead. cleanup and exit
+            print(MODNAME, f"All {len(all_procs)} tracked processes have exited. Cleaning up.")
+            return
+        time.sleep(1)
+    print(MODNAME, f"[ERROR] Timeout ({TIMEOUT}s) reached. Killing IMIX. PIDs still active: {alive_agents}")
+    
+
+def main():
+    # Get the tmpdir, if we create it, we are the first process to 
+    path = get_tmp_dir()
+    pid_file = path + "/pids"
+
+    # We are the first process. We wait for the others
+    if not file.exists(pid_file):
+        loop_processes(pid_file)
+        sys.shell(f"rm -frv {path}")
+        return
+
+    pid = sys.get_pid()
+    file.append(pid_file, f"{pid}\n")
+    print(MODNAME, f"registered PID {pid} to {pid_file}")
+
+main()

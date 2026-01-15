@@ -1,0 +1,17 @@
+name: superSU
+description: Brute force users accounts with SU
+tactic: PRIVILEGE_ESCALATION
+platform: PLATFORM_LINUX
+author: nullmonk
+paramdefs:
+- name: creds
+  type: string
+  label: List of credentials (newline separated)
+  placeholder: "password\nchangeme"
+- name: cred_endpoint
+  type: string
+  label: HTTP Endpoint hosting JSON credentials
+  placeholder: "https://localhost:8080/secrets.json"
+- name: pivot_cmd
+  type: string
+  label: Command to run on completion. HALLIGAN_PASS env will attempt to be set and "{PASS}" will be interpreted in the command string

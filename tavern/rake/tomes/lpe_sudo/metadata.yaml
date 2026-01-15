@@ -1,0 +1,15 @@
+name: lpe_sudo
+description: Try to run ourself as sudo if we are not root
+tactic: PRIVILEGE_ESCALATION
+platform: PLATFORM_LINUX
+author: nullmonk
+support_model: UNSPECIFIED
+paramdefs:
+- name: cmd
+  type: string
+  label: command to run (defaults to parent process)
+  placeholder: /usr/bin/id
+- name: password
+  type: string
+  label: the current users credential
+  placeholder: hunter2
