@@ -50,3 +50,4 @@ node_modules/
 
 .gemini/
 rake.db*
+halligan.jsonl

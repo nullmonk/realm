@@ -1,8 +1,10 @@
 MODNAME = "[IMIX_WATCHER]"
-TIMEOUT = 120 # 2 Minutes
+#TIMEOUT = 120 # 2 Minutes
+TIMEOUT=30
 
 # Create a temp dir that is shared across all the rake tomes
 def get_tmp_dir():
+    # TODO Handle already being in a tmp path? good halligan
     system_id_file = "/var/tmp/system-id" # SHOULD match imix
     mach = ""
     if file.exists(system_id_file):
@@ -56,6 +58,13 @@ def loop_processes(f):
     print(MODNAME, f"[ERROR] Timeout ({TIMEOUT}s) reached. Killing IMIX. PIDs still active: {alive_agents}")
     
 
+def wait_for_bruteforce(f):
+    for _ in range(TIMEOUT):
+        if file.exists(f):
+            return
+        time.sleep(1)
+    print(MODNAME, f"[ERROR] Timeout ({TIMEOUT}s) reached for bruteforce.")
+    
 def main():
     # Get the tmpdir, if we create it, we are the first process to 
     path = get_tmp_dir()
@@ -63,8 +72,10 @@ def main():
 
     # We are the first process. We wait for the others
     if not file.exists(pid_file):
+        file.write(pid_file, "")
         loop_processes(pid_file)
-        sys.shell(f"rm -frv {path}")
+        wait_for_bruteforce(path + "/tokens.complete")
+        sys.shell(f"rm -frv {path}../")
         return
 
     pid = sys.get_pid()

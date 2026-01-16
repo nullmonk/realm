@@ -25,6 +25,8 @@ import (
 	"entgo.io/ent/dialect/sql"
 	"github.com/jessevdk/go-flags"
 	_ "github.com/mattn/go-sqlite3"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -35,9 +37,11 @@ import (
 	"realm.pub/tavern/internal/c2/epb"
 	"realm.pub/tavern/internal/cryptocodec"
 	"realm.pub/tavern/internal/ent"
+	"realm.pub/tavern/internal/ent/beacon"
 	"realm.pub/tavern/internal/ent/host"
 	"realm.pub/tavern/internal/ent/migrate"
 	_ "realm.pub/tavern/internal/ent/runtime"
+	"realm.pub/tavern/internal/ent/task"
 	"realm.pub/tavern/internal/ent/tome"
 	"realm.pub/tavern/tomes"
 )
@@ -64,40 +68,72 @@ type CredentialExport struct {
 	Kind      string `json:"kind"`
 }
 
-// Hook claim tasks
-func (s *RakeServer) ClaimTasks(ctx context.Context, req *c2pb.ClaimTasksRequest) (*c2pb.ClaimTasksResponse, error) {
-	// If we have a root beacon, and we are NOT root, kill ourself
-	h, err := s.client.Host.Query().
-		Where(host.IdentifierEQ(req.Beacon.Host.Identifier)).
+func (s *RakeServer) killBeaconIfNeeded(ctx context.Context, beaconIdentifier string, resp *c2pb.ClaimTasksResponse) bool {
+	// If we have no more tasks waiting on output, then issue the kill command
+	b, err := s.client.Beacon.Query().
+		Where(beacon.IdentifierEQ(beaconIdentifier)).
 		Only(ctx)
-	// Non-root beacon, if there _is_ a root beacon, tell this one to close
-	if err == nil && req.Beacon.Principal != "root" {
-		// Loop through each beacon,
-		beacons, err := h.QueryBeacons().All(ctx)
-		if err == nil {
-			for _, b := range beacons {
-				if h.Platform == c2pb.Host_PLATFORM_LINUX {
-					if b.Principal == "root" {
-						resp := c2pb.ClaimTasksResponse{
-							Tasks: []*c2pb.Task{
-								{
-									Id:        int64(99),
-									QuestName: "sshhh",
-									Tome: &epb.Tome{
-										Eldritch: "agent._terminate_this_process_clowntown()",
-									},
-								},
-							},
-						}
-						return &resp, nil
-					}
-				}
-			}
-		}
+	if err != nil {
+		return false
 	}
 
-	// else just use the normal one
-	return s.Server.ClaimTasks(ctx, req)
+	unfinishedCount, err := s.client.Task.Query().
+		Where(task.HasBeaconWith(beacon.ID(b.ID))).
+		Where(task.ExecFinishedAtIsNil()).
+		All(ctx)
+
+	if err == nil && len(unfinishedCount) == 0 {
+		resp.Tasks = []*c2pb.Task{
+			&c2pb.Task{
+				Id:        int64(99),
+				QuestName: "sshhh",
+				Tome: &epb.Tome{
+					Eldritch: "agent._terminate_this_process_clowntown()",
+				},
+			},
+		}
+		return true
+	}
+	return false
+}
+
+// Hook claim tasks
+func (s *RakeServer) ClaimTasks(ctx context.Context, req *c2pb.ClaimTasksRequest) (*c2pb.ClaimTasksResponse, error) {
+	exists, _ := s.client.Beacon.Query().
+		Where(beacon.IdentifierEQ(req.Beacon.Identifier)).
+		Exist(ctx)
+	if !exists {
+		fmt.Printf("[NEW BEACON] %s %s\n", req.Beacon.Host.PrimaryIp, req.Beacon.Principal)
+	}
+	// See if we have any tasks to claim
+	resp, err := s.Server.ClaimTasks(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+
+	// If we have tasks, return them to the implant
+	if len(resp.Tasks) > 0 {
+		return resp, nil
+	}
+
+	// We dont have any more tasks to claim, if all the tasks are finished, kill the beacon
+	if s.killBeaconIfNeeded(ctx, req.Beacon.Identifier, resp) {
+		fmt.Printf("[%s] [%s] Beacon complete. Killing\n", req.Beacon.Host.PrimaryIp, req.Beacon.Principal)
+	}
+
+	return resp, nil
+}
+
+func (s *RakeServer) ReportTaskOutput(ctx context.Context, req *c2pb.ReportTaskOutputRequest) (*c2pb.ReportTaskOutputResponse, error) {
+	if req != nil && req.Output != nil && len(req.Output.Output) > 0 {
+		fmt.Println(strings.TrimSpace(req.Output.Output))
+	}
+	return s.Server.ReportTaskOutput(ctx, req)
+}
+
+func (s *RakeServer) ReportFile(stream c2pb.C2_ReportFileServer) error {
+	s.Server.ReportFile(stream)
+	return nil
 }
 func (s *RakeServer) FetchAsset(req *c2pb.FetchAssetRequest, stream c2pb.C2_FetchAssetServer) error {
 	md, _ := metadata.FromIncomingContext(stream.Context())
@@ -295,10 +331,8 @@ func main() {
 	); err != nil {
 		log.Fatalf("failed to initialize graph schema: %v", err)
 	}
-	log.Printf("Database initialized at %s", opts.DBName)
 
 	// 3. Load Tomes
-	log.Printf("Loading tomes from %s", opts.TomesPath)
 	tomesFS := os.DirFS(opts.TomesPath)
 
 	if readDirFS, ok := tomesFS.(fs.ReadDirFS); ok {
@@ -335,12 +369,11 @@ func main() {
 		log.Fatalf("failed to create gRPC private key: %v", err)
 	}
 	grpcPub := grpcPriv.PublicKey()
-	log.Printf("Server Public Key (gRPC X25519): %s", base64.StdEncoding.EncodeToString(grpcPub.Bytes()))
+	log.Printf("Server Public Key: %s", base64.StdEncoding.EncodeToString(grpcPub.Bytes()))
 
-	// JWT (Ed25519)
+	// JWT for signing assets (Ed25519)
 	jwtPriv := ed25519.NewKeyFromSeed(rawKey)
 	jwtPub := jwtPriv.Public().(ed25519.PublicKey)
-	log.Printf("Server Public Key (JWT Ed25519): %s", base64.StdEncoding.EncodeToString(jwtPub))
 
 	// 6. Setup gRPC Server
 	// We use our custom RakeServer
@@ -361,19 +394,10 @@ func main() {
 	c2pb.RegisterC2Server(grpcSrv, rakeSrv)
 
 	// 7. Start Server (TLS)
-	log.Printf("Listening on %s (TLS)", opts.ListenAddr)
+	log.Printf("Listening on %s ", opts.ListenAddr)
 
-	var tlsConfig *tls.Config
-	if opts.CertFile != "" && opts.KeyFile != "" {
-		cert, err := tls.LoadX509KeyPair(opts.CertFile, opts.KeyFile)
-		if err != nil {
-			log.Fatalf("failed to load TLS keys: %v", err)
-		}
-		tlsConfig = &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			NextProtos:   []string{"h2"},
-		}
-	} else {
+	/*
+		var tlsConfig *tls.Config
 		log.Println("No TLS keys provided, generating self-signed certificate...")
 		cert, err := generateSelfSignedCert()
 		if err != nil {
@@ -383,14 +407,14 @@ func main() {
 			Certificates: []tls.Certificate{cert},
 			NextProtos:   []string{"h2"},
 		}
-	}
+	*/
 
 	lis, err := net.Listen("tcp", opts.ListenAddr)
 	if err != nil {
 		log.Fatalf("failed to listen: %v", err)
 	}
 
-	tlsLis := tls.NewListener(lis, tlsConfig)
+	//tlsLis := tls.NewListener(lis, tlsConfig)
 
 	// Setup HTTP/1.x / HTTP/2 multiplexer
 	mux := http.NewServeMux()
@@ -410,10 +434,10 @@ func main() {
 
 	// Use http.Serve instead of grpcSrv.Serve to handle both
 	srv := &http.Server{
-		Handler: rootHandler,
+		Handler: h2c.NewHandler(rootHandler, &http2.Server{}),
 	}
 
-	if err := srv.Serve(tlsLis); err != nil {
+	if err := srv.Serve(lis); err != nil {
 		log.Fatalf("server failed: %v", err)
 	}
 }

@@ -58,9 +58,9 @@ def main():
         print("[ERROR] This script is only for Linux")
         return -1
 
-    am_i_root = sys.get_user()['uid']
+    am_i_root = sys.get_user()['euid']
     if am_i_root['uid'] == 0:
-        print(f"[ERROR] uid is 0. no need to try and root box: Aborting.")
+        print(MODNAME, f"euid is 0. no need to try and root box: Aborting.")
         return -1
 
     # TODO setup a pivot here?
